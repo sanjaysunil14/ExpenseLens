@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { apiRequest } from "./api.js";
+import AnalyticsScreen from "./components/AnalyticsScreen.jsx";
 import AuthScreen from "./components/AuthScreen.jsx";
 import DashboardScreen from "./components/DashboardScreen.jsx";
+import InteractiveBackground from "./components/InteractiveBackground.jsx";
+import NavBar from "./components/NavBar.jsx";
+import QuickAddModal from "./components/QuickAddModal.jsx";
+import CommandPalette from "./components/CommandPalette.jsx";
+import CsvImportModal from "./components/CsvImportModal.jsx";
+import Toast from "./components/Toast.jsx";
 import {
   emptyExpenseForm,
   emptySummary,
@@ -13,6 +20,7 @@ import {
   createAuthHeaders,
   getMonthOptions,
 } from "./lib/dashboard.js";
+import { exportExpensesToCSV } from "./lib/exportCsv.js";
 
 const App = () => {
   const [token, setToken] = useState(() => getStoredToken());
@@ -35,6 +43,91 @@ const App = () => {
   const [submittingAuth, setSubmittingAuth] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [currentPage, setCurrentPage] = useState("dashboard");
+
+  // Modals & Command Palette
+  const [isQuickAddOpen, setIsQuickAddOpen] = useState(false);
+  const [isCmdOpen, setIsCmdOpen] = useState(false);
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const [toast, setToast] = useState({ message: "", type: "success" });
+
+  // Theme Management (Light / Dark)
+  const [theme, setTheme] = useState(() => {
+    return localStorage.getItem("expenselens_theme") || "dark";
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("expenselens_theme", theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  };
+
+  const showToast = (message, type = "success") => {
+    setToast({ message, type });
+  };
+
+  const closeToast = () => {
+    setToast({ message: "", type: "success" });
+  };
+
+  // Global Card Mousemove Spotlight Follower (Linear / Raycast effect on ALL cards)
+  useEffect(() => {
+    const handleGlobalCardMouseMove = (e) => {
+      const card = e.target.closest(".card");
+      if (card) {
+        const rect = card.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        card.style.setProperty("--mouse-x", `${x}px`);
+        card.style.setProperty("--mouse-y", `${y}px`);
+      }
+    };
+
+    window.addEventListener("mousemove", handleGlobalCardMouseMove, { passive: true });
+    return () => window.removeEventListener("mousemove", handleGlobalCardMouseMove);
+  }, []);
+
+  // Global Keyboard shortcut listener ('⌘K' for Command Palette, 'N' for Quick Add, '/' for search)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      const tagName = e.target.tagName.toLowerCase();
+      const isInput = tagName === "input" || tagName === "textarea" || tagName === "select";
+
+      // ⌘K or Ctrl+K opens Command Palette anywhere
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        if (token) {
+          setIsCmdOpen((prev) => !prev);
+        }
+        return;
+      }
+
+      if (isInput) return;
+
+      // 'N' for Quick Add
+      if (e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        if (token) {
+          setIsQuickAddOpen(true);
+        }
+      }
+
+      // '/' for search focus
+      if (e.key === "/") {
+        e.preventDefault();
+        const searchInput = document.querySelector('input[placeholder*="Search by merchant"]');
+        if (searchInput) {
+          searchInput.focus();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [token]);
 
   const monthOptions = useMemo(
     () => getMonthOptions(expenses, summary),
@@ -53,7 +146,7 @@ const App = () => {
   const handleRequestError = (error, shouldLogoutOnAuthFailure = false) => {
     const message = error?.payload?.message || error.message || "Something went wrong";
     setErrorMessage(message);
-    setFeedback("");
+    showToast(message, "error");
 
     if (shouldLogoutOnAuthFailure && error.statusCode === 401) {
       clearStoredToken();
@@ -157,11 +250,8 @@ const App = () => {
       setToken(response.token);
       setUser(response.user);
       setAuthForm(initialAuthForm);
-      setFeedback(
-        isLoginMode
-          ? "Welcome back. Your dashboard is ready."
-          : "Account created successfully.",
-      );
+      await loadDashboard(response.token, filters);
+      showToast(isLoginMode ? "Welcome back! Logged in successfully." : "Account created! Welcome to ExpenseLens.");
     } catch (error) {
       handleRequestError(error);
     } finally {
@@ -173,15 +263,14 @@ const App = () => {
     clearStoredToken();
     setToken("");
     resetDashboardState();
-    setFeedback("You have been signed out.");
-    setErrorMessage("");
+    setCurrentPage("dashboard");
+    showToast("Signed out safely.");
   };
 
   const applyFilters = async (event) => {
-    event.preventDefault();
+    if (event) event.preventDefault();
     setLoading(true);
     setErrorMessage("");
-    setFeedback("");
 
     try {
       await loadDashboard(token, filters);
@@ -202,10 +291,10 @@ const App = () => {
     setFilters(nextFilters);
     setLoading(true);
     setErrorMessage("");
-    setFeedback("");
 
     try {
       await loadDashboard(token, nextFilters);
+      showToast("Filters reset.");
     } catch (error) {
       handleRequestError(error, true);
     } finally {
@@ -213,11 +302,30 @@ const App = () => {
     }
   };
 
+  const handleFilterByCategory = (catIdentifier) => {
+    const foundCategory = categories.find(
+      (c) => String(c.id) === String(catIdentifier) || c.name.toLowerCase() === String(catIdentifier).toLowerCase(),
+    );
+    const categoryId = foundCategory ? String(foundCategory.id) : "";
+    const nextFilters = { ...filters, categoryId };
+    setFilters(nextFilters);
+    setCurrentPage("dashboard");
+    loadDashboard(token, nextFilters);
+    showToast(`Filtered by ${foundCategory?.name || "category"}`);
+  };
+
+  const handleFilterByMonth = (month) => {
+    const nextFilters = { ...filters, month };
+    setFilters(nextFilters);
+    setCurrentPage("dashboard");
+    loadDashboard(token, nextFilters);
+    showToast(`Filtered for ${month}`);
+  };
+
   const handleExpenseSubmit = async (event) => {
     event.preventDefault();
     setSubmittingExpense(true);
     setErrorMessage("");
-    setFeedback("");
 
     try {
       const path = editingExpenseId
@@ -234,15 +342,83 @@ const App = () => {
       await loadDashboard(token, filters);
       setExpenseForm(emptyExpenseForm);
       setEditingExpenseId(null);
-      setFeedback(
+      showToast(
         editingExpenseId
           ? "Expense updated successfully."
-          : "Expense added successfully.",
+          : `Expense of ₹${expenseForm.amount} added.`,
       );
     } catch (error) {
       handleRequestError(error, true);
     } finally {
       setSubmittingExpense(false);
+    }
+  };
+
+  const handleQuickAddSubmit = async (payload) => {
+    setSubmittingExpense(true);
+    try {
+      await apiRequest("/api/expenses", {
+        method: "POST",
+        headers: createAuthHeaders(token),
+        body: JSON.stringify(payload),
+      });
+
+      await loadDashboard(token, filters);
+      setIsQuickAddOpen(false);
+      showToast(`Expense of ₹${payload.amount} logged!`);
+    } catch (error) {
+      handleRequestError(error, true);
+    } finally {
+      setSubmittingExpense(false);
+    }
+  };
+
+  const handleDuplicateExpense = async (expense) => {
+    try {
+      const payload = {
+        merchant: expense.merchant,
+        amount: expense.amount,
+        categoryId: expense.categoryId,
+        expenseDate: new Date().toISOString().slice(0, 10),
+        notes: expense.notes ? `Repeat: ${expense.notes}` : "Repeat expense",
+      };
+
+      await apiRequest("/api/expenses", {
+        method: "POST",
+        headers: createAuthHeaders(token),
+        body: JSON.stringify(payload),
+      });
+
+      await loadDashboard(token, filters);
+      showToast(`Duplicated ₹${expense.amount} for ${expense.merchant}!`);
+    } catch (error) {
+      handleRequestError(error, true);
+    }
+  };
+
+  const handleBatchImport = async (rows = []) => {
+    try {
+      const authHeaders = createAuthHeaders(token);
+      await Promise.all(
+        rows.map((row) =>
+          apiRequest("/api/expenses", {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              merchant: row.merchant,
+              amount: row.amount,
+              categoryId: row.categoryId,
+              expenseDate: row.expenseDate,
+              notes: row.notes || "Imported via CSV",
+            }),
+          })
+        )
+      );
+
+      await loadDashboard(token, filters);
+      showToast(`Imported ${rows.length} transactions successfully!`);
+    } catch (error) {
+      handleRequestError(error, true);
     }
   };
 
@@ -255,8 +431,9 @@ const App = () => {
       expenseDate: String(expense.expenseDate).slice(0, 10),
       notes: expense.notes || "",
     });
-    setFeedback("");
     setErrorMessage("");
+    setCurrentPage("dashboard");
+    window.scrollTo({ top: 400, behavior: "smooth" });
   };
 
   const stopEditingExpense = () => {
@@ -271,9 +448,6 @@ const App = () => {
       return;
     }
 
-    setErrorMessage("");
-    setFeedback("");
-
     try {
       await apiRequest(`/api/expenses/${expenseId}`, {
         method: "DELETE",
@@ -281,7 +455,7 @@ const App = () => {
       });
 
       await loadDashboard(token, filters);
-      setFeedback("Expense deleted successfully.");
+      showToast("Expense deleted.");
 
       if (editingExpenseId === expenseId) {
         stopEditingExpense();
@@ -291,46 +465,130 @@ const App = () => {
     }
   };
 
+  const handleBulkDeleteExpense = async (ids = []) => {
+    try {
+      const authHeaders = createAuthHeaders(token);
+      await Promise.all(
+        ids.map((id) =>
+          apiRequest(`/api/expenses/${id}`, {
+            method: "DELETE",
+            headers: authHeaders,
+          })
+        )
+      );
+
+      await loadDashboard(token, filters);
+      showToast(`Deleted ${ids.length} expenses successfully.`);
+    } catch (error) {
+      handleRequestError(error, true);
+    }
+  };
+
+  const handleExportStatement = () => {
+    const dateStr = new Date().toISOString().slice(0, 10);
+    exportExpensesToCSV(expenses, `ExpenseLens_Statement_${dateStr}.csv`);
+  };
+
   if (!token) {
     return (
-      <AuthScreen
-        authForm={authForm}
-        authMode={authMode}
-        errorMessage={errorMessage}
-        feedback={feedback}
-        onAuthFormChange={handleAuthFormChange}
-        onModeToggle={handleAuthModeToggle}
-        onSubmit={handleAuthSubmit}
-        submittingAuth={submittingAuth}
-      />
+      <>
+        <Toast message={toast.message} type={toast.type} onClose={closeToast} />
+        <AuthScreen
+          authForm={authForm}
+          authMode={authMode}
+          errorMessage={errorMessage}
+          feedback={feedback}
+          onAuthFormChange={handleAuthFormChange}
+          onModeToggle={handleAuthModeToggle}
+          onSubmit={handleAuthSubmit}
+          submittingAuth={submittingAuth}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+        />
+      </>
     );
   }
 
   return (
-    <DashboardScreen
-      bootstrapping={bootstrapping}
-      categories={categories}
-      editingExpenseId={editingExpenseId}
-      errorMessage={errorMessage}
-      expenseForm={expenseForm}
-      expenses={expenses}
-      feedback={feedback}
-      filters={filters}
-      loading={loading}
-      monthOptions={monthOptions}
-      onDeleteExpense={handleDeleteExpense}
-      onExpenseFieldChange={handleExpenseFieldChange}
-      onExpenseSubmit={handleExpenseSubmit}
-      onFilterChange={handleFilterChange}
-      onFilterReset={resetFilters}
-      onFilterSubmit={applyFilters}
-      onLogout={handleLogout}
-      onStartEditExpense={handleEditExpense}
-      onStopEditingExpense={stopEditingExpense}
-      submittingExpense={submittingExpense}
-      summary={summary}
-      user={user}
-    />
+    <>
+      <InteractiveBackground />
+      <Toast message={toast.message} type={toast.type} onClose={closeToast} />
+
+      <CommandPalette
+        isOpen={isCmdOpen}
+        onClose={() => setIsCmdOpen(false)}
+        expenses={expenses}
+        onOpenQuickAdd={() => setIsQuickAddOpen(true)}
+        onNavigate={setCurrentPage}
+        onToggleTheme={toggleTheme}
+        theme={theme}
+        onExportCsv={handleExportStatement}
+        onResetFilters={resetFilters}
+        onSelectExpense={handleEditExpense}
+      />
+
+      <QuickAddModal
+        isOpen={isQuickAddOpen}
+        onClose={() => setIsQuickAddOpen(false)}
+        categories={categories}
+        onSubmit={handleQuickAddSubmit}
+        submitting={submittingExpense}
+      />
+
+      <CsvImportModal
+        isOpen={isImportOpen}
+        onClose={() => setIsImportOpen(false)}
+        categories={categories}
+        onBatchImport={handleBatchImport}
+      />
+
+      <NavBar
+        currentPage={currentPage}
+        onNavigate={setCurrentPage}
+        user={user}
+        onLogout={handleLogout}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onOpenQuickAdd={() => setIsQuickAddOpen(true)}
+      />
+
+      {currentPage === "analytics" ? (
+        <AnalyticsScreen
+          summary={summary}
+          expenses={expenses}
+          categories={categories}
+        />
+      ) : (
+        <DashboardScreen
+          bootstrapping={bootstrapping}
+          categories={categories}
+          editingExpenseId={editingExpenseId}
+          errorMessage={errorMessage}
+          expenseForm={expenseForm}
+          expenses={expenses}
+          feedback={feedback}
+          filters={filters}
+          loading={loading}
+          monthOptions={monthOptions}
+          onDeleteExpense={handleDeleteExpense}
+          onBulkDeleteExpense={handleBulkDeleteExpense}
+          onDuplicateExpense={handleDuplicateExpense}
+          onOpenImport={() => setIsImportOpen(true)}
+          onExpenseFieldChange={handleExpenseFieldChange}
+          onExpenseSubmit={handleExpenseSubmit}
+          onFilterChange={handleFilterChange}
+          onFilterReset={resetFilters}
+          onFilterSubmit={applyFilters}
+          onStartEditExpense={handleEditExpense}
+          onStopEditingExpense={stopEditingExpense}
+          submittingExpense={submittingExpense}
+          summary={summary}
+          user={user}
+          onFilterByCategory={handleFilterByCategory}
+          onFilterByMonth={handleFilterByMonth}
+        />
+      )}
+    </>
   );
 };
 
